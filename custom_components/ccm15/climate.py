@@ -13,15 +13,14 @@ import logging
 import json
 import voluptuous as vol
 
-from homeassistant.components.climate import (ClimateDevice, PLATFORM_SCHEMA)
+from homeassistant.components.climate import (ClimateEntity, PLATFORM_SCHEMA)
 from homeassistant.components.climate.const import (
-    ATTR_HVAC_MODE, HVAC_MODE_COOL, HVAC_MODE_DRY, HVAC_MODE_FAN_ONLY,
-    HVAC_MODE_HEAT, SUPPORT_FAN_MODE, HVAC_MODE_AUTO, HVAC_MODE_OFF,
-    SUPPORT_TARGET_TEMPERATURE)
+    ATTR_HVAC_MODE, HVACMode, ClimateEntityFeature)
 from homeassistant.const import (CONF_NAME, CONF_HOST, CONF_PORT,
-                                 TEMP_CELSIUS, ATTR_TEMPERATURE)
+                                 UnitOfTemperature, ATTR_TEMPERATURE)
 import homeassistant.helpers.config_validation as cv
 import xmltodict
+import xml
 import requests
 REQUIREMENTS = ['xmltodict==0.11.0']
 
@@ -41,12 +40,12 @@ CONST_MODE_FAN_MIDDLE = 'middle'
 CONST_MODE_FAN_HIGH = 'high'
 CONST_MODE_FAN_OFF = 'off'
 
-CONST_STATE_CMD_MAP = {HVAC_MODE_COOL:0, HVAC_MODE_HEAT:1, HVAC_MODE_DRY:2, HVAC_MODE_FAN_ONLY:3, HVAC_MODE_OFF:4, HVAC_MODE_AUTO:5}
+CONST_STATE_CMD_MAP = {HVACMode.COOL:0, HVACMode.HEAT:1, HVACMode.DRY:2, HVACMode.FAN_ONLY:3, HVACMode.OFF:4, HVACMode.AUTO:5}
 CONST_CMD_STATE_MAP = {v: k for k, v in CONST_STATE_CMD_MAP.items()}
 CONST_FAN_CMD_MAP = {CONST_MODE_FAN_AUTO:0, CONST_MODE_FAN_LOW:2, CONST_MODE_FAN_MIDDLE:3, CONST_MODE_FAN_HIGH:4, CONST_MODE_FAN_OFF:5}
 CONST_CMD_FAN_MAP = {v: k for k, v in CONST_FAN_CMD_MAP.items()}
 
-SUPPORT_HVAC = [HVAC_MODE_COOL, HVAC_MODE_HEAT, HVAC_MODE_DRY, HVAC_MODE_FAN_ONLY, HVAC_MODE_OFF, HVAC_MODE_AUTO]
+SUPPORT_HVAC = [HVACMode.COOL, HVACMode.HEAT, HVACMode.DRY, HVACMode.FAN_ONLY, HVACMode.OFF, HVACMode.AUTO]
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
@@ -54,7 +53,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
     vol.Optional(CONF_PORT, default=80): cv.positive_int,
 })
 
-SUPPORT_FLAGS = (SUPPORT_TARGET_TEMPERATURE | SUPPORT_FAN_MODE)
+SUPPORT_FLAGS = (ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.FAN_MODE)
 
 # parse data from ccm bytes
 def get_status_from(s):
@@ -161,6 +160,9 @@ def poll_status(host, port):
     except requests.exceptions.ConnectionError:
         _LOGGER.error("No route to device at %s", resource)
         return None
+    except xml.parsers.expat.ExpatError:
+        _LOGGER.error("Error parse xml %s| %s" % (response, response.text))
+        return None
 
     acs = {}
     for ac_name, ac_binary in data.items():
@@ -185,12 +187,13 @@ def setup_platform(hass, config, add_devices, discovery_info=None):
 
 # pylint: disable=abstract-method
 # pylint: disable=too-many-instance-attributes
-class Thermostat(ClimateDevice):
+class Thermostat(ClimateEntity):
     """Representation of a Midea thermostat."""
 
     def __init__(self, name, ac_name, host, port, acdata):
         """Initialize the thermostat."""
         self._name = '{}_{}'.format(name, ac_name)
+        self._acdata=''
         self._ac_name = ac_name
         pn = int(ac_name.strip('a'))
         self._ac_id = 2 ** pn
@@ -228,9 +231,15 @@ class Thermostat(ClimateDevice):
 
     def update(self):
         """Update the data from the thermostat."""
-        acdata = poll_status(self._host, self._port)[self._ac_name]
+        status = poll_status(self._host, self._port)
+        if not status:
+            return
+        acdata = status[self._ac_name]
+        if self._acdata == acdata:
+          return
+        self._acdata=acdata
+        
         self.updateWithAcdata(acdata)
-        _LOGGER.debug("Update called")
 
     def setStates(self):
         """Set new target states."""
@@ -269,7 +278,7 @@ class Thermostat(ClimateDevice):
     @property
     def temperature_unit(self):
         """Return the unit of measurement."""
-        return TEMP_CELSIUS
+        return UnitOfTemperature.CELSIUS
 
     @property
     def current_temperature(self):
@@ -290,7 +299,7 @@ class Thermostat(ClimateDevice):
         else:
             self._current_settemp = int(math.ceil(temperature)) if temperature > self._current_settemp else int(math.floor(temperature))
             self.setStates()
-            self.async_write_ha_state()
+            self.schedule_update_ha_state()
 
     @property
     def hvac_mode(self):
@@ -300,12 +309,12 @@ class Thermostat(ClimateDevice):
     def set_hvac_mode(self, hvac_mode):
         """Set hvac mode."""
         if hvac_mode not in CONST_STATE_CMD_MAP:
-            hvac_mode = HVAC_MODE_OFF
+            hvac_mode = HVACMode.OFF
         if self._current_state != hvac_mode and self._current_fan == CONST_MODE_FAN_OFF:
             self._current_fan = self._current_setfan
         self._current_state = hvac_mode
         self.setStates()
-        self.async_write_ha_state()
+        self.schedule_update_ha_state()
         return
 
     @property
@@ -320,12 +329,12 @@ class Thermostat(ClimateDevice):
 
     def set_fan_mode(self, fan):
         """Set new target fan mode."""
-        if self._current_state == HVAC_MODE_OFF:
+        if self._current_state == HVACMode.OFF:
             return
         if fan not in CONST_FAN_CMD_MAP:
             fan = CONST_MODE_FAN_AUTO
         if fan == CONST_MODE_FAN_OFF:
-            self._current_state = HVAC_MODE_OFF
+            self._current_state = HVACMode.OFF
 
         self._current_fan = fan
 
@@ -333,7 +342,7 @@ class Thermostat(ClimateDevice):
             self._current_setfan = self._current_fan
 
         self.setStates()
-        self.async_write_ha_state()
+        self.schedule_update_ha_state()
         return
 
     @property
